@@ -1,0 +1,193 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    
+    function getUserDataExists() {
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+    
+    function isCoach() {
+      return isAuthenticated() && getUserDataExists() && getUserData().role == 'coach';
+    }
+    
+    function isStudent() {
+      return isAuthenticated() && getUserDataExists() && getUserData().role == 'student';
+    }
+    
+    function getUserTeamId() {
+      return getUserDataExists() ? getUserData().teamId : null;
+    }
+    
+    function isSameTeam(teamId) {
+      return isAuthenticated() && teamId != null && getUserTeamId() == teamId;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    // Users Collection
+    match /users/{userId} {
+      // Users can read their own data
+      allow read: if isOwner(userId);
+      
+      // Users can create their own document during signup
+      allow create: if isOwner(userId) && request.resource.data.uid == userId;
+      
+      // Users can update their own data (but not change role or uid)
+      allow update: if isOwner(userId) 
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.role == resource.data.role;
+    }
+    
+    // Questions Collection
+    match /questions/{questionId} {
+      // Anyone authenticated can read public questions
+      // Team members can read their team's private questions
+      // Coaches can read all questions they created
+      allow read: if isAuthenticated() && (
+        resource.data.isPublic == true ||
+        (resource.data.isPublic == false && isSameTeam(resource.data.teamId)) ||
+        (isCoach() && resource.data.createdBy == request.auth.uid)
+      );
+      
+      // Only coaches can create questions
+      allow create: if isCoach() 
+        && request.resource.data.createdBy == request.auth.uid;
+      
+      // Only the creator can update their questions
+      allow update: if isCoach() 
+        && resource.data.createdBy == request.auth.uid
+        && request.resource.data.createdBy == resource.data.createdBy;
+      
+      // Only the creator can delete their questions
+      allow delete: if isCoach() 
+        && resource.data.createdBy == request.auth.uid;
+    }
+    
+    // Teams Collection
+    match /teams/{teamId} {
+      // Team members and coaches can read their team
+      allow read: if isAuthenticated() && (
+        isSameTeam(teamId) ||
+        (isCoach() && resource.data.coachId == request.auth.uid)
+      );
+      
+      // Only coaches can create teams
+      allow create: if isCoach() 
+        && request.resource.data.coachId == request.auth.uid;
+      
+      // Only the team's coach can update the team
+      allow update: if isCoach() 
+        && resource.data.coachId == request.auth.uid;
+      
+      // Only the team's coach can delete the team
+      allow delete: if isCoach() 
+        && resource.data.coachId == request.auth.uid;
+    }
+    
+    // Players Collection
+    match /players/{playerId} {
+      // Players can read their own data
+      // Team members can read players in their team
+      // Coaches can read players in their team
+      allow read: if isAuthenticated() && (
+        isOwner(playerId) ||
+        isOwner(resource.data.userId) ||
+        (resource.data.teamId != null && isSameTeam(resource.data.teamId))
+      );
+      
+      // Can create player document during signup (for students)
+      allow create: if isAuthenticated() 
+        && request.resource.data.userId == request.auth.uid;
+      
+      // Players can update their own stats (limited fields)
+      // Note: Cloud Functions have admin access and bypass these rules
+      allow update: if isAuthenticated() 
+        && resource.data.userId == request.auth.uid;
+    }
+    
+    // Games Collection
+    match /games/{gameId} {
+      // Users can read games they're involved in
+      allow read: if isAuthenticated() && (
+        resource.data.playerId == request.auth.uid ||
+        (resource.data.coachId != null && resource.data.coachId == request.auth.uid) ||
+        (resource.data.teamId != null && isSameTeam(resource.data.teamId))
+      );
+      
+      // Users can create games for themselves
+      allow create: if isAuthenticated() 
+        && request.resource.data.playerId == request.auth.uid;
+      
+      // Users can update games they're involved in
+      // Note: Cloud Functions have admin access and bypass these rules
+      allow update: if isAuthenticated() && (
+        resource.data.playerId == request.auth.uid ||
+        (resource.data.coachId != null && resource.data.coachId == request.auth.uid)
+      );
+    }
+    
+    // Match History Collection
+    match /matchHistory/{matchId} {
+      // Users can read match history for their team or their own matches
+      allow read: if isAuthenticated() && (
+        resource.data.playerId == request.auth.uid ||
+        (resource.data.teamId != null && isSameTeam(resource.data.teamId))
+      );
+      
+      // Users can create their own match history
+      // Note: Cloud Functions have admin access and bypass these rules
+      allow create: if isAuthenticated() 
+        && request.resource.data.playerId == request.auth.uid;
+    }
+    
+    // Leaderboards Collection
+    match /leaderboards/{leaderboardId} {
+      // Team members can read their team's leaderboard
+      allow read: if isAuthenticated() 
+        && resource.data.teamId != null 
+        && isSameTeam(resource.data.teamId);
+      
+      // Cloud Functions have admin access, so they bypass these rules
+      // No client-side writes allowed for leaderboards
+      allow write: if false;
+    }
+    
+    // Settings Collection
+    match /settings/{settingsId} {
+      // Team members can read their team's settings
+      // Anyone can read default settings
+      allow read: if isAuthenticated() && (
+        settingsId == 'default' ||
+        (getUserTeamId() != null && settingsId == getUserTeamId())
+      );
+      
+      // Only coaches can update settings for their team
+      allow write: if isCoach() && (
+        settingsId == 'default' ||
+        (getUserTeamId() != null && settingsId == getUserTeamId())
+      );
+    }
+    
+    // Match States Collection (for real-time game state)
+    match /matchStates/{gameId} {
+      // Users can read match states for games they're involved in
+      allow read: if isAuthenticated();
+      
+      // Users can create/update match states for their games
+      // Cloud Functions can manage all match states
+      allow write: if isAuthenticated();
+    }
+  }
+}
